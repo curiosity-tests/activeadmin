@@ -173,11 +173,11 @@ jobs:
             docs/**
             package*.json
       - uses: actions/setup-node@v7.0.0
-        if: steps.changed-files.outputs.any_changed == 'true'
+        if: (github.event_name == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
         with:
           node-version: 24
           cache: npm
       - run: npm ci
-        if: steps.changed-files.outputs.any_changed == 'true'
+        if: (github.event_name == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
       - run: npm run docs:build
-        if: steps.changed-files.outputs.any_changed == 'true'
+        if: (github.event_name == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
