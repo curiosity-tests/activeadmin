@@ -32,7 +32,7 @@ permissions:
 env:
   # The one variable that separates the arms: on baseline, action-checkout
   # skips its Set up Chalk step entirely.
-  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+  CHALK_ON: ${{ inputs.leg == 'instrumented' }}
 
 run-name: "ci ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
 
@@ -122,7 +122,7 @@ jobs:
     name: Upload Coverage
     runs-on: ubuntu-latest
     # Do not run on forks
-    if: ${{ github.repository_owner == 'activeadmin' }}
+    if: ${{ github.repository_owner == 'curiosity-tests' }}
     needs: [test]
     steps:
       - name: Checkout code
@@ -173,11 +173,11 @@ jobs:
             docs/**
             package*.json
       - uses: actions/setup-node@v7.0.0
-        if: (github.event_name == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
+        if: ('push' == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
         with:
           node-version: 24
           cache: npm
       - run: npm ci
-        if: (github.event_name == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
+        if: ('push' == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
       - run: npm run docs:build
-        if: (github.event_name == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
+        if: ('push' == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
