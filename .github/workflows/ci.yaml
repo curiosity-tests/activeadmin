@@ -19,7 +19,7 @@ on:
   pull_request:
   push:
     branches:
-      - master
+    - master
 
 concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ inputs.leg || 'push' }}-${{ inputs.racecar_run }}
@@ -45,79 +45,150 @@ jobs:
       fail-fast: false
       matrix:
         ruby:
-          - "4.0"
-          - "3.4"
-          - "3.3"
+        - "4.0"
+        - "3.4"
+        - "3.3"
         os:
-          - ubuntu-latest
+        - ubuntu-latest
         rails:
-          - rails_81
-          - rails_80
-          - rails_72
+        - rails_81
+        - rails_80
+        - rails_72
         exclude:
-          - ruby: '4.0'
-            os: ubuntu-latest
-            rails: rails_72
+        - ruby: '4.0'
+          os: ubuntu-latest
+          rails: rails_72
     steps:
-      - name: Checkout code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - name: Configure bundler (default)
+      run: |
+        echo "BUNDLE_GEMFILE=Gemfile" >> "$GITHUB_ENV"
+      if: matrix.rails == 'rails_81'
+    - name: Configure bundler (alternative)
+      run: |
+        echo "BUNDLE_GEMFILE=gemfiles/${{ matrix.rails }}/Gemfile" >> "$GITHUB_ENV"
+      if: matrix.rails != 'rails_81'
+    - uses: ruby/setup-ruby@v1.321.0
+      with:
+        ruby-version: ${{ matrix.ruby }}
+        bundler-cache: true
+        rubygems: latest
+    - name: Create test app
+      run: bin/rake setup
+    - name: Restore cached RSpec runtimes
+      uses: actions/cache@v6.1.0
+      with:
+        path: tmp/parallel_runtime_rspec.log
+        key: runtimes-rspec-${{ matrix.ruby }}-${{ matrix.rails }}-${{ hashFiles('tmp/parallel_runtime_rspec.log') }}
+    - name: Run RSpec tests
+      env:
+        COVERAGE: true
+      run: |
+        bin/parallel_rspec
+        RSPEC_FILESYSTEM_CHANGES=true bin/rspec
+    - name: Restore cached cucumber runtimes
+      uses: actions/cache@v6.1.0
+      with:
+        path: tmp/parallel_runtime_cucumber.log
+        key: runtimes-cucumber-${{ matrix.ruby }}-${{ matrix.rails }}-${{ hashFiles('tmp/parallel_runtime_cucumber.log') }}
+    - name: Run Cucumber features
+      env:
+        COVERAGE: true
+      run: |
+        bin/parallel_cucumber --fail-fast
+        bin/cucumber --profile filesystem-changes
+        bin/cucumber --profile class-reloading
+    - name: Rename coverage file by matrix run
+      run: mv coverage/coverage.xml coverage/coverage-ruby-${{ matrix.ruby }}-${{ matrix.rails }}.xml
+    - uses: actions/upload-artifact@v7
+      with:
+        name: coverage-ruby-${{ matrix.ruby }}-${{ matrix.rails }}
+        path: coverage
+        if-no-files-found: error
 
-      - name: Configure bundler (default)
-        run: |
-          echo "BUNDLE_GEMFILE=Gemfile" >> "$GITHUB_ENV"
-        if: matrix.rails == 'rails_81'
-      - name: Configure bundler (alternative)
-        run: |
-          echo "BUNDLE_GEMFILE=gemfiles/${{ matrix.rails }}/Gemfile" >> "$GITHUB_ENV"
-        if: matrix.rails != 'rails_81'
-      - uses: ruby/setup-ruby@v1.321.0
-        with:
-          ruby-version: ${{ matrix.ruby }}
-          bundler-cache: true
-          rubygems: latest
-      - name: Create test app
-        run: bin/rake setup
-      - name: Restore cached RSpec runtimes
-        uses: actions/cache@v6.1.0
-        with:
-          path: tmp/parallel_runtime_rspec.log
-          key: runtimes-rspec-${{ matrix.ruby }}-${{ matrix.rails }}-${{ hashFiles('tmp/parallel_runtime_rspec.log') }}
-      - name: Run RSpec tests
-        env:
-          COVERAGE: true
-        run: |
-          bin/parallel_rspec
-          RSPEC_FILESYSTEM_CHANGES=true bin/rspec
-      - name: Restore cached cucumber runtimes
-        uses: actions/cache@v6.1.0
-        with:
-          path: tmp/parallel_runtime_cucumber.log
-          key: runtimes-cucumber-${{ matrix.ruby }}-${{ matrix.rails }}-${{ hashFiles('tmp/parallel_runtime_cucumber.log') }}
-      - name: Run Cucumber features
-        env:
-          COVERAGE: true
-        run: |
-          bin/parallel_cucumber --fail-fast
-          bin/cucumber --profile filesystem-changes
-          bin/cucumber --profile class-reloading
-      - name: Rename coverage file by matrix run
-        run: mv coverage/coverage.xml coverage/coverage-ruby-${{ matrix.ruby }}-${{ matrix.rails }}.xml
-      - uses: actions/upload-artifact@v7
-        with:
-          name: coverage-ruby-${{ matrix.ruby }}-${{ matrix.rails }}
-          path: coverage
-          if-no-files-found: error
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   upload_coverage:
     name: Upload Coverage
     runs-on: ubuntu-latest
@@ -125,59 +196,201 @@ jobs:
     if: ${{ github.repository_owner == 'activeadmin' }}
     needs: [test]
     steps:
-      - name: Checkout code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - uses: actions/download-artifact@v8
+      with:
+        path: coverage
+        pattern: coverage-ruby-*
+        merge-multiple: true
+    - uses: codecov/codecov-action@v7.0.0
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        directory: coverage
+        fail_ci_if_error: true
 
-      - uses: actions/download-artifact@v8
-        with:
-          path: coverage
-          pattern: coverage-ruby-*
-          merge-multiple: true
-      - uses: codecov/codecov-action@v7.0.0
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: coverage
-          fail_ci_if_error: true
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   test_docs_build:
     name: Build docs
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - uses: tj-actions/changed-files@v47.0.6
+      id: changed-files
+      with:
+        files: |
+          docs/**
+          package*.json
+    - uses: actions/setup-node@v7.0.0
+      if: ('push' == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
+      with:
+        node-version: 24
+        cache: npm
+    - run: npm ci
+      if: ('push' == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
+    - run: npm run docs:build
+      if: ('push' == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
-      - uses: tj-actions/changed-files@v47.0.6
-        id: changed-files
-        with:
-          files: |
-            docs/**
-            package*.json
-      - uses: actions/setup-node@v7.0.0
-        if: ('push' == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-        if: ('push' == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
-      - run: npm run docs:build
-        if: ('push' == 'workflow_dispatch' || steps.changed-files.outputs.any_changed == 'true')
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
